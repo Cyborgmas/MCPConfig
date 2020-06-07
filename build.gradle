@@ -17,6 +17,8 @@ import de.undercouch.gradle.tasks.download.Download
 import groovy.io.FileType
 import groovy.json.JsonSlurper
 import groovy.json.JsonBuilder
+
+import java.text.SimpleDateFormat
 import java.util.zip.ZipFile
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
@@ -1004,30 +1006,96 @@ subprojects {
         doLast {
             def renames = [:]
             def rrenames = [:]
+            def wildrenames = [:] as LinkedHashMap<String, String>
             def errors = []
-            file('renames.txt').eachLine{ line ->
+
+            file('renames.txt').eachLine{line ->
                 def (entry, comment) = splitComment(line)
                 if (entry == null)
                     return
                 def (o, n) = entry.split(' ')
-                if (renames.containsKey(o))
-                    errors.add('Duplicate: ' + line + ' Old: ' + o + ' ' + renames[o]);
-                if (rrenames.containsKey(n.toLowerCase()))
-                    errors.add('Already Claimed: ' + line + ' Old: ' + rrenames[n.toLowerCase()] + ' ' + n);
-                renames[o] = n
-                rrenames[n.toLowerCase()] = o
-                logger.lifecycle('Rename: ' + o + ' -> ' + n)
+
+                if(o.endsWith('/*') && n.endsWith('/*')) {
+                    def wo = o.substring(0, o.length()-1)
+                    def wn = n.substring(0, n.length()-1)
+                    if (wildrenames.containsKey(wo))
+                        errors.add('Duplicate wildcard: ' + line + ' Old: ' + wo + ' ' + renames[wo]);
+                    wildrenames[wo] = wn
+                    logger.lifecycle('Wildcard added:' + wo + ' -> ' + wn)
+                }
+                else {
+                    if(line.contains('*'))
+                        errors.add('Invalid wildcard ' + line + ' Old: ' + o + ' New: ' + n + ' must both finish with /*.')
+                    if (renames.containsKey(o))
+                        errors.add('Duplicate: ' + line + ' Old: ' + o + ' ' + renames[o]);
+                    if (rrenames.containsKey(n.toLowerCase()))
+                        errors.add('Already Claimed: ' + line + ' Old: ' + rrenames[n.toLowerCase()] + ' ' + n);
+                    renames[o] = n
+                    rrenames[n.toLowerCase()] = o
+                    logger.lifecycle('Rename: ' + o + ' -> ' + n)
+                }
             }
-            
+
             def lines = file(PATH_VERSION + 'joined.tsrg').readLines()
-            
+
             def existing = lines.stream().map{ l -> splitComment(l)[0].split(' ') }.filter { l -> l.length == 2 }.map{ l -> l[1] }.collect(Collectors.toList())
-            
-            renames.each {o, n -> 
+
+            renames.each {o, n ->
                 if(existing.contains(n) && !renames.containsKey(n))
                     errors.add('Name Claimed with no rename: ' + o + ' -> ' + n)
             }
-            
+
+            //sort from most subpackages to least. if a/b/c/ will move entirely, first move a/b/c/d/ for example, which could be assigned with more precision
+            wildrenames = wildrenames.sort {v1,v2 -> v2.getKey().split('/').size() - v1.getKey().split('/').size() }
+
+            for(Map.Entry<String, String> entry : wildrenames){ //check that there is no movement to a package that is already being moved.
+                for(Map.Entry<String, String> other : wildrenames){
+                    if(entry == other ) continue;
+                    if(other.getValue().contains(entry.getKey())){
+                        errors.add('Moving ' + entry.getKey() + ' to ' + entry.getValue() + ' while moving ' + other.getKey() + ' to ' + other.getValue() + ', which would also be moved.')
+                    }
+                }
+            }
+
+            //check if renamed classes are in packages that will no longer exists.
+            def copy = renames
+            wildrenames.each {wo,wn ->
+                copy.forEach {o, n ->
+                    if(n.startsWith(wo)) {
+                        errors.add('Moving ' + wo + ' to ' + wn + ' but mapping of ' + o + ' points to ' + n + ', a package that is getting relocated.')
+//                        def nn = (n as String).replaceFirst(wo, wn)
+//
+//                        if(existing.contains(nn) || rrenames.containsKey(nn.toLowerCase()))
+//                            errors.add('Moving ' + wo + ' to ' + wn + ' caused mapping of ' + o + ' to change from ' + n + ' to ' + renames[o] + ' but name already exists.')
+//
+//                        renames[o] = nn
+//                        rrenames.remove(n)
+//                        renames[nn.toLowerCase()] = o
+//                        logger.lifecycle('Renamed ' + o + ' to ' + n + ' but moving ' + wo + ' to ' + wn + '. Final rename: ' + renames[o])
+                    }
+                }
+            }
+
+
+            def wildcardfile = file('repackaging.txt')
+            wildcardfile.createNewFile()
+            wildcardfile.append('\n\n#####' + new Date().format('yyyy-MM-dd HH:mm:ss') + '#####\n\n\n')
+            wildrenames.each {wo, wn ->
+                existing.each {l ->
+                    if(l.startsWith(wo)) {
+                        def nl = l.replace(wo, wn)
+                        if(existing.contains(renames[nl]) || rrenames.containsKey(nl))
+                            errors.add('Moving ' + wo + ' to ' + wn + ' caused mapping of ' + l + ' to change to ' + nl + ' but name already exists.')
+
+                        renames[l] = nl
+                        rrenames[nl.toLowerCase()] = l
+                        logger.lifecycle('Changing package - Old: ' + l + ' New: ' + nl)
+                        wildcardfile.append(l + ' ' + nl + '\n')
+                    }
+                }
+            }
+
+
             if (!errors.isEmpty())
                 throw new RuntimeException(errors.join('\n'))
             
